@@ -98,6 +98,16 @@
          (given-spec (composiphrase--get-spec-from-symbol given-name given-verb-p config)))
     (cdr (assq (if given-verb-p 'default-object 'default-verb) given-spec))))
 
+(defun composiphrase-sentence-modifiers (sentence)
+  "Return modifiers from SENTENCE as alist."
+  (mapcar
+   (lambda (word) (cons (cdr (assq 'parameter-name word))
+                        (cdr (assq 'contents word))))
+   (cl-remove-if-not
+    (lambda (word) (eq 'modifier
+                       (cdr (assq 'word-type word))))
+    sentence)))
+
 (defun composiphrase--match (sentence config)
   "Find a match for SENTENCE using the CONFIG.
 Return nil if no match is found.
@@ -107,13 +117,7 @@ Otherwise, return a cons pair (PARAMS . EXECUTOR), containing the final paramete
                          sentence))
          (object (seq-find (lambda (word) (eq 'object (cdr (assq 'word-type word))))
                            sentence))
-         (given-modifiers (mapcar
-                           (lambda (word) (cons (cdr (assq 'parameter-name word))
-                                                (cdr (assq 'contents word))))
-                           (cl-remove-if-not
-                            (lambda (word) (eq 'modifier
-                                               (cdr (assq 'word-type word))))
-                            sentence))))
+         (given-modifiers (composiphrase-sentence-modifiers sentence)))
     (when (and (not verb) (not object))
       (error "composiphrase: sentence lacks both verb and object: %s" sentence))
     ;; TODO - deeper validation of the structure of command sentence words, to be sure all parts are there.
