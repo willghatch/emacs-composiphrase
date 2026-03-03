@@ -73,6 +73,17 @@
 ;;;
 ;;; Also, just go look at the demo configuration.
 ;;;
+;;; Aggregation:
+;;; When adding words to a sentence, you can optionally include an `accumulator'
+;;; field on a modifier word.  The accumulator is a function of two arguments:
+;;; (EXISTING-VALUE NEW-VALUE) -> COMBINED-VALUE.  When a word with an
+;;; accumulator is added, if there is already a modifier in the sentence with
+;;; the same `parameter-name', the two values are combined using the accumulator
+;;; function, and the existing word is replaced rather than having two words with
+;;; the same parameter-name.  If there is no existing word with that
+;;; parameter-name, the accumulator is called with nil as the first argument.
+;;; This aggregation happens at add-time, not at match-time.
+;;;
 ;;; Public API:
 ;;; * `composiphrase-execute'
 ;;; * `composiphrase-current-sentence'
@@ -249,15 +260,54 @@ Otherwise, return a cons pair (PARAMS . EXECUTOR), containing the final paramete
   (interactive)
   (setq composiphrase-current-sentence nil))
 
+(defun composiphrase--aggregate-word-into-sentence (word sentence)
+  "Add WORD to SENTENCE, applying accumulator-based aggregation if applicable.
+If WORD has an `accumulator' field and is a modifier, look for an existing
+modifier in SENTENCE with the same `parameter-name'.  If found, combine the
+values using the accumulator function and replace the existing word.  If not
+found, call the accumulator with nil as the existing value and add the word.
+Returns the new sentence."
+  (let ((accumulator (cdr (assq 'accumulator word)))
+        (word-type (cdr (assq 'word-type word)))
+        (param-name (cdr (assq 'parameter-name word))))
+    (if (and accumulator (eq word-type 'modifier) param-name)
+        (let* ((existing (seq-find
+                          (lambda (w)
+                            (and (eq 'modifier (cdr (assq 'word-type w)))
+                                 (eq param-name (cdr (assq 'parameter-name w)))))
+                          sentence))
+               (existing-value (and existing (cdr (assq 'contents existing))))
+               (new-value (cdr (assq 'contents word)))
+               (combined (funcall accumulator existing-value new-value))
+               (new-word (mapcar (lambda (pair)
+                                   (if (eq (car pair) 'contents)
+                                       (cons 'contents combined)
+                                     pair))
+                                 word))
+               (filtered-sentence (if existing
+                                      (cl-remove-if
+                                       (lambda (w)
+                                         (and (eq 'modifier (cdr (assq 'word-type w)))
+                                              (eq param-name (cdr (assq 'parameter-name w)))))
+                                       sentence)
+                                    sentence)))
+          (cons new-word filtered-sentence))
+      (cons word sentence))))
+
 (defun composiphrase-add-to-current-sentence (&rest words)
-  "add words to composisphrase-current-sentence (and also add the keys used to add the command (WIP))"
+  "add words to composisphrase-current-sentence (and also add the keys used to add the command (WIP))
+When a word has an `accumulator' field, aggregation is applied: see the
+commentary section on Aggregation for details."
   (let ((word1 (car words))
         (words-rest (cdr words)))
     (unless nil ;;no-keys
       ;; TODO - how can I get the keys for numeric arguments and uses of M-x, etc?
       (setq word1 (cons (cons 'keys (this-command-keys))
                         word1)))
-    (setq composiphrase-current-sentence (append (list word1) words-rest composiphrase-current-sentence))))
+    (let ((new-sentence composiphrase-current-sentence))
+      (dolist (w (append (list word1) words-rest))
+        (setq new-sentence (composiphrase--aggregate-word-into-sentence w new-sentence)))
+      (setq composiphrase-current-sentence new-sentence))))
 
 (defun composiphrase-add-to-current-sentence-with-numeric-handling (exec-after-p &rest words)
   "Takes a list of composiphrase words, but returns an interactive function that takes a numeric argument, and adds the numeric argument to the modifier parameter 'num'.
