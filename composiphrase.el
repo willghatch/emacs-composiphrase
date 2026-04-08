@@ -54,6 +54,7 @@
 ;;; * verbs - has a list of verb specifications
 ;;; * objects - has a list of object specifications
 ;;; * match-table - has a list of match-table specifications
+;;; * sentence-pre-transformers - (optional) a list of pre-transformer specifications
 ;;;
 ;;; A verb specification is a list (VERB-NAME MODIFIER-SPEC ...)
 ;;; An object specification is a list (OBJECT-NAME MODIFIER-SPEC ...)
@@ -84,6 +85,41 @@
 ;;; parameter-name, the accumulator is called with nil as the first argument.
 ;;; This aggregation happens at add-time, not at match-time.
 ;;;
+;;; Sentence Pre-Transformers:
+;;;
+;;; Pre-transformers allow you to rewrite a sentence before the main match table
+;;; is consulted.  This is useful for handling modifier-like concepts (such as
+;;; "alternate") that change which object or verb should actually be used,
+;;; without cluttering the main match table with combinatorial entries.
+;;;
+;;; The config key `sentence-pre-transformers' holds a list of pre-transformers.
+;;; Each pre-transformer is a match table (a list of match entries) with the
+;;; same structure as the main match table, except the fourth element of each
+;;; entry is a transformer function instead of an executor.
+;;;
+;;; A pre-transformer match entry: (VERB OBJECT MODIFIERS TRANSFORMER)
+;;; * VERB, OBJECT, MODIFIERS: same matching rules as the main match table.
+;;; * TRANSFORMER: a function that takes two arguments -- the current sentence
+;;;   and the matched params alist -- and returns a new (transformed) sentence.
+;;;   The matched params alist uses holds the modifiers from the match,
+;;;   including default modifiers where the modifier was absent from the
+;;;   sentence.  Explicit sentence modifiers override defaults from the matched
+;;;   verb and object specs.  For example, a move/word sentence could pass
+;;;   ((direction . forward) (location-within . beginning)).
+;;;
+;;; Pre-transformers are run in order.  Each pre-transformer's match table is
+;;; consulted against the current sentence; if a match is found, the transformer
+;;; function is called and its return value replaces the sentence.  The same
+;;; pre-transformer is then consulted again, and this repeats until that
+;;; pre-transformer no longer matches.  The number of consecutive matches for
+;;; each pre-transformer is bounded by
+;;; `composiphrase-pre-transformer-max-matches' to avoid infinite loops.
+;;; The resulting sentence is then passed to the next pre-transformer, and
+;;; finally to the main matcher.
+;;;
+;;; The transformer function can also call (require ...) to load libraries
+;;; needed by the replacement object or verb.
+;;;
 ;;; Public API:
 ;;; * `composiphrase-execute'
 ;;; * `composiphrase-current-sentence'
@@ -93,6 +129,20 @@
 ;;; * `composiphrase-add-to-current-sentence-with-numeric-handling'
 ;;; * `composiphrase-execute-current-sentence'
 ;;; * `composiphrase-current-ui-hints'
+;;; * `composiphrase-verb-p'
+;;; * `composiphrase-object-p'
+;;; * `composiphrase-modifier-p'
+
+(require 'cl-lib)
+
+(defvar-local composiphrase-current-sentence nil)
+(defvar composiphrase-current-configuration nil)
+
+(defvar composiphrase-pre-transformer-max-matches 20
+  "Maximum number of consecutive matches allowed for one pre-transformer.
+`composiphrase--apply-pre-transformers' errors when a single
+pre-transformer hits this limit while rewriting one sentence.")
+
 
 (defun composiphrase--get-spec-from-symbol (given-v-or-o given-verb-p config)
   "Takes a symbol name for a verb or an object, returns the spec from the config."
@@ -109,6 +159,27 @@
          (given-spec (composiphrase--get-spec-from-symbol given-name given-verb-p config)))
     (cdr (assq (if given-verb-p 'default-object 'default-verb) given-spec))))
 
+(defun composiphrase--word-type-p (word word-type &optional parameter-name)
+  "Return non-nil if WORD has WORD-TYPE.
+When PARAMETER-NAME is non-nil, WORD must also have that parameter name."
+  (and word
+       (eq word-type (cdr (assq 'word-type word)))
+       (or (null parameter-name)
+           (eq parameter-name (cdr (assq 'parameter-name word))))))
+
+(defun composiphrase-verb-p (word)
+  "Return non-nil if WORD is a composiphrase verb word."
+  (composiphrase--word-type-p word 'verb))
+
+(defun composiphrase-object-p (word)
+  "Return non-nil if WORD is a composiphrase object word."
+  (composiphrase--word-type-p word 'object))
+
+(cl-defun composiphrase-modifier-p (word &key parameter-name)
+  "Return non-nil if WORD is a composiphrase modifier word.
+When PARAMETER-NAME is non-nil, WORD must also have that parameter name."
+  (composiphrase--word-type-p word 'modifier parameter-name))
+
 (defun composiphrase-sentence-modifiers (sentence)
   "Return modifiers from SENTENCE as alist."
   (mapcar
@@ -119,70 +190,93 @@
                        (cdr (assq 'word-type word))))
     sentence)))
 
-(defun composiphrase--match (sentence config)
-  "Find a match for SENTENCE using the CONFIG.
-Return nil if no match is found.
-Otherwise, return a cons pair (PARAMS . EXECUTOR), containing the final parameters and executor from the match.
-"
+(defun composiphrase--match-context (sentence config &optional no-error)
+  "Return match context for SENTENCE in CONFIG.
+The return value is a list (VERB-NAME OBJECT-NAME PARAMS).
+When NO-ERROR is non-nil, return nil instead of signaling an error if the
+sentence cannot be resolved to both a verb and an object."
   (let* ((verb (seq-find (lambda (word) (eq 'verb (cdr (assq 'word-type word))))
                          sentence))
          (object (seq-find (lambda (word) (eq 'object (cdr (assq 'word-type word))))
                            sentence))
          (given-modifiers (composiphrase-sentence-modifiers sentence)))
-    (when (and (not verb) (not object))
-      (error "composiphrase: sentence lacks both verb and object: %s" sentence))
-    ;; TODO - deeper validation of the structure of command sentence words, to be sure all parts are there.
-    (let* ((verb (or verb
-                     (composiphrase--get-default-verb-or-obj object nil config)
-                     (error "composiphrase: can't resolve a verb for sentence: %s" sentence)))
-           (object (or object
-                       (composiphrase--get-default-verb-or-obj verb t config)
-                       (error "composiphrase: can't resolve an object for sentence: %s" sentence)))
-           (verb-name (composiphrase--get-verb-or-obj-name verb))
-           (object-name (composiphrase--get-verb-or-obj-name object))
-           (verb-spec (composiphrase--get-spec-from-symbol verb-name t config))
-           (object-spec (composiphrase--get-spec-from-symbol object-name nil config))
-           ;; TODO - check for duplicate param names, and probably error.
-           (full-default-params (append verb-spec object-spec))
-           (full-param-keys (seq-uniq
-                             (mapcar 'car
-                                     (append full-default-params
-                                             given-modifiers))))
-           (params (mapcar (lambda (param-name)
-                             (or (assq param-name given-modifiers)
-                                 (assq param-name full-default-params)))
-                           full-param-keys))
-           (match-table (cdr (assq 'match-table config)))
-           (matched nil))
-      (while (and (not matched)
-                  match-table)
-        (let* ((entry (car match-table))
-               (verb-sym-match (eq verb-name (car entry)))
-               (object-sym-match (eq object-name (cadr entry)))
-               (verb-match (or verb-sym-match
-                               (and (not (symbolp (car entry)))
-                                    (functionp (car entry))
-                                    ;; Don't try to match predicate if object
-                                    ;; match already failed symbol eq
-                                    (or object-sym-match (functionp (cadr entry)))
-                                    (funcall (car entry) verb-name))))
-               (object-match (or object-sym-match
-                                 (and verb-match
-                                      (not (symbolp (cadr entry)))
-                                      (functionp (cadr entry))
-                                      (funcall (cadr entry) object-name))))
-               (vo-match (and verb-match object-match))
-               (entry-mods (and vo-match
-                                (caddr entry)))
-               (full-match (and vo-match
-                                (composiphrase--match-table-modifiers-match-p
-                                 params
-                                 entry-mods))))
-          (when full-match
-            (setq matched entry))
-          (setq match-table (cdr match-table))))
-      (and matched
-           (cons params (seq-elt matched 3))))))
+    (cond
+     ((and (not verb) (not object))
+      (unless no-error
+        (error "composiphrase: sentence lacks both verb and object: %s" sentence)))
+     (t
+      ;; TODO - deeper validation of the structure of command sentence words, to be sure all parts are there.
+      (let* ((verb-word-or-name
+              (or verb
+                  (and object (composiphrase--get-default-verb-or-obj object nil config))
+                  (unless no-error
+                    (error "composiphrase: can't resolve a verb for sentence: %s" sentence))))
+             (object-word-or-name
+              (or object
+                  (and verb (composiphrase--get-default-verb-or-obj verb t config))
+                  (unless no-error
+                    (error "composiphrase: can't resolve an object for sentence: %s" sentence)))))
+        (when (and verb-word-or-name object-word-or-name)
+          (let* ((verb-name (composiphrase--get-verb-or-obj-name verb-word-or-name))
+                 (object-name (composiphrase--get-verb-or-obj-name object-word-or-name))
+                 (verb-spec (composiphrase--get-spec-from-symbol verb-name t config))
+                 (object-spec (composiphrase--get-spec-from-symbol object-name nil config))
+                 ;; TODO - check for duplicate param names, and probably error.
+                 (full-default-params (append verb-spec object-spec))
+                 (full-param-keys (seq-uniq
+                                   (mapcar 'car
+                                           (append full-default-params
+                                                   given-modifiers))))
+                 (params (mapcar (lambda (param-name)
+                                   (or (assq param-name given-modifiers)
+                                       (assq param-name full-default-params)))
+                                 full-param-keys)))
+            (list verb-name object-name params))))))))
+
+(defun composiphrase--match-table-word-match-p (matcher word-name)
+  "Return non-nil if MATCHER matches WORD-NAME.
+The symbol `_` is a wildcard for any resolved verb or object.  Other symbols
+match by `eq`, and functions are called as predicates with WORD-NAME."
+  (and word-name
+       (cond
+        ((eq matcher '_) t)
+        ((symbolp matcher) (eq word-name matcher))
+        ((functionp matcher) (funcall matcher word-name)))))
+
+(defun composiphrase--match-table-entry-match-p (entry verb-name object-name params)
+  "Return non-nil if match-table ENTRY matches VERB-NAME, OBJECT-NAME, and PARAMS."
+  (and (composiphrase--match-table-word-match-p (car entry) verb-name)
+       (composiphrase--match-table-word-match-p (cadr entry) object-name)
+       (composiphrase--match-table-modifiers-match-p params (caddr entry))))
+
+(defun composiphrase--match-table-find-match
+    (match-table verb-name object-name params)
+  "Return the first MATCH-TABLE entry matching VERB-NAME, OBJECT-NAME, and PARAMS."
+  (let ((table match-table)
+        (matched nil))
+    (while (and (not matched)
+                table)
+      (let ((entry (car table)))
+        (when (composiphrase--match-table-entry-match-p
+               entry verb-name object-name params)
+          (setq matched entry)))
+      (setq table (cdr table)))
+    matched))
+
+(defun composiphrase--match (sentence config)
+  "Find a match for SENTENCE using the CONFIG.
+Return nil if no match is found.
+Otherwise, return a cons pair (PARAMS . EXECUTOR), containing the final parameters and executor from the match.
+"
+  (let* ((context (composiphrase--match-context sentence config))
+         (verb-name (car context))
+         (object-name (cadr context))
+         (params (caddr context))
+         (matched (composiphrase--match-table-find-match
+                   (cdr (assq 'match-table config))
+                   verb-name object-name params)))
+    (and matched
+         (cons params (seq-elt matched 3)))))
 
 
 (defun composiphrase--match-table-modifiers-match-p
@@ -227,11 +321,55 @@ Otherwise, return a cons pair (PARAMS . EXECUTOR), containing the final paramete
                                             spec)))
           (t (error "bad executor spec: %s" spec)))))
 
+(defun composiphrase--pre-transformer-match (sentence pre-transformer config)
+  "Try to match SENTENCE against PRE-TRANSFORMER match table entries.
+PRE-TRANSFORMER is a list of match entries using the same verb/object
+definitions from CONFIG.  Returns nil if no match is found, or a cons
+pair (PARAMS . TRANSFORMER-FUNC) if a match is found."
+  ;; Pre-transformers may legitimately not match sentences that lack enough
+  ;; parts to resolve both verb and object, so return nil instead of erroring.
+  (let ((context (composiphrase--match-context sentence config t)))
+    (when context
+      (let* ((verb-name (car context))
+             (object-name (cadr context))
+             (params (caddr context))
+             (matched (composiphrase--match-table-find-match
+                       pre-transformer verb-name object-name params)))
+        (and matched
+             (cons params (seq-elt matched 3)))))))
+
+(defun composiphrase--apply-pre-transformers (sentence config)
+  "Apply sentence-pre-transformers from CONFIG to SENTENCE.
+Pre-transformers are run in order.  Each one may repeatedly rewrite
+the sentence until it no longer matches, before the next
+pre-transformer (and eventually the main matcher) sees it.
+Returns the (possibly transformed) sentence."
+  (let ((pre-transformers (cdr (assq 'sentence-pre-transformers config)))
+        (current-sentence sentence))
+    (dolist (pt pre-transformers)
+      (let ((pt-match (composiphrase--pre-transformer-match
+                       current-sentence pt config))
+            (match-count 0))
+        (while pt-match
+          (when (>= match-count composiphrase-pre-transformer-max-matches)
+            (error "composiphrase: sentence pre-transformer matched %s times; possible infinite loop"
+                   composiphrase-pre-transformer-max-matches))
+          (let ((params (car pt-match))
+                (transformer (cdr pt-match)))
+            (setq match-count (1+ match-count))
+            (setq current-sentence
+                  (funcall transformer current-sentence params))
+            (setq pt-match (composiphrase--pre-transformer-match
+                            current-sentence pt config))))))
+    current-sentence))
+
 (defun composiphrase-execute (sentence config)
-  (let ((match (composiphrase--match sentence config)))
+  (let* ((transformed-sentence (composiphrase--apply-pre-transformers
+                                sentence config))
+         (match (composiphrase--match transformed-sentence config)))
     (if match
-        (composiphrase--execute-match sentence (car match) (cdr match))
-      (error "No executor found for command sentence: %s" sentence))))
+        (composiphrase--execute-match transformed-sentence (car match) (cdr match))
+      (error "No executor found for command sentence: %s" transformed-sentence))))
 
 (defun composiphrase--apply-params-to-sentence (old-sentence params)
   "For each param in PARAMS that is not in OLD-SENTENCE, add the param to a new sentence (whose tail is the old sentence)."
@@ -250,8 +388,7 @@ Otherwise, return a cons pair (PARAMS . EXECUTOR), containing the final paramete
                 new-sentence))))
     new-sentence))
 
-(defvar-local composiphrase-current-sentence nil)
-(defvar composiphrase-current-configuration nil)
+
 
 ;; TODO - should I have just one previous sentence, or have a history that keeps up to N elements?  For now I'll do the simplest thing for my immediate wants.
 (defvar-local composiphrase--previous-sentence nil)
