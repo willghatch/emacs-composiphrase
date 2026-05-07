@@ -349,6 +349,82 @@
                                 count-word word-c)))
         (should (= 15 (cdr (assq 'contents (car continued-result)))))))))
 
+(ert-deftest composiphrase-accumulator-ui-hint-updates-to-combined-value-test ()
+  "Test that the ui-hint field is updated to the combined value after accumulation.
+This is a regression test: previously, ui-hint was left at the incoming word's
+value rather than being updated to reflect the accumulated contents."
+  (let* ((sum-accumulator (lambda (existing new)
+                            (+ (or existing 0) new)))
+         (word-a `((word-type . modifier)
+                   (parameter-name . count)
+                   (contents . 10)
+                   (ui-hint . 10)
+                   (accumulator . ,sum-accumulator)))
+         (word-b `((word-type . modifier)
+                   (parameter-name . count)
+                   (contents . 1)
+                   (ui-hint . 1)
+                   (accumulator . ,sum-accumulator)))
+         (result (composiphrase-test-current-sentence-from-words
+                  word-a word-b)))
+    (let ((count-word (seq-find
+                       (lambda (w)
+                         (and (eq 'modifier (cdr (assq 'word-type w)))
+                              (eq 'count (cdr (assq 'parameter-name w)))))
+                       result)))
+      (should count-word)
+      ;; contents should be accumulated: 10 + 1 = 11
+      (should (= 11 (cdr (assq 'contents count-word))))
+      ;; ui-hint should reflect the combined value, not the stale incoming value
+      (should (= 11 (cdr (assq 'ui-hint count-word)))))))
+
+(ert-deftest composiphrase-accumulator-ui-hint-absent-still-works-test ()
+  "Test that accumulation works normally when ui-hint is absent from the word."
+  (let* ((sum-accumulator (lambda (existing new)
+                            (+ (or existing 0) new)))
+         (word-a `((word-type . modifier)
+                   (parameter-name . count)
+                   (contents . 5)
+                   (accumulator . ,sum-accumulator)))
+         (word-b `((word-type . modifier)
+                   (parameter-name . count)
+                   (contents . 3)
+                   (accumulator . ,sum-accumulator)))
+         (result (composiphrase-test-current-sentence-from-words
+                  word-a word-b)))
+    (let ((count-word (seq-find
+                       (lambda (w)
+                         (and (eq 'modifier (cdr (assq 'word-type w)))
+                              (eq 'count (cdr (assq 'parameter-name w)))))
+                       result)))
+      (should count-word)
+      (should (= 8 (cdr (assq 'contents count-word))))
+      ;; No ui-hint should be present if neither word had one
+      (should-not (assq 'ui-hint count-word)))))
+
+(ert-deftest composiphrase-accumulator-ui-hint-composiphrase-current-ui-hints-test ()
+  "Test that composiphrase-current-ui-hints returns the updated accumulated value."
+  (let* ((sum-accumulator (lambda (existing new)
+                            (+ (or existing 0) new)))
+         (word-a `((word-type . modifier)
+                   (parameter-name . count)
+                   (contents . 10)
+                   (ui-hint . 10)
+                   (accumulator . ,sum-accumulator)))
+         (word-b `((word-type . modifier)
+                   (parameter-name . count)
+                   (contents . 1)
+                   (ui-hint . 1)
+                   (accumulator . ,sum-accumulator))))
+    (with-temp-buffer
+      (composiphrase-clear-current-sentence)
+      (composiphrase-add-to-current-sentence word-a)
+      (composiphrase-add-to-current-sentence word-b)
+      (let ((hints (composiphrase-current-ui-hints)))
+        ;; Should have one hint and it should be the combined value 11, not 1
+        (should (= 1 (length hints)))
+        (should (= 11 (car hints)))))))
+
 (ert-deftest composiphrase-add-to-current-sentence-custom-accumulator-test ()
   "Test aggregation with a custom accumulator that takes the max of two values."
   (let* ((max-accumulator (lambda (existing new)

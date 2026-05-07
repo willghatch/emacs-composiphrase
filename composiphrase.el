@@ -417,9 +417,11 @@ Returns the new sentence."
                (new-value (cdr (assq 'contents word)))
                (combined (funcall accumulator existing-value new-value))
                (new-word (mapcar (lambda (pair)
-                                   (if (eq (car pair) 'contents)
-                                       (cons 'contents combined)
-                                     pair))
+                                   (cond ((eq (car pair) 'contents)
+                                          (cons 'contents combined))
+                                         ((eq (car pair) 'ui-hint)
+                                          (cons 'ui-hint combined))
+                                         (t pair)))
                                  word))
                (filtered-sentence (if existing
                                       (cl-remove-if
